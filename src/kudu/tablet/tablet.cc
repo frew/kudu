@@ -357,7 +357,7 @@ void Tablet::StartTransaction(WriteTransactionState* tx_state) {
 }
 
 Status Tablet::InsertUnlocked(WriteTransactionState *tx_state,
-                              RowOp* insert) {
+                              RowOp* insert, int offset) {
   const TabletComponents* comps = DCHECK_NOTNULL(tx_state->tablet_components());
 
   CHECK(state_ == kOpen || state_ == kBootstrapping);
@@ -366,6 +366,26 @@ Status Tablet::InsertUnlocked(WriteTransactionState *tx_state,
   DCHECK(insert->has_row_lock()) << "RowOp must hold the row lock.";
   DCHECK_EQ(tx_state->schema_at_decode_time(), schema()) << "Raced against schema change";
   DCHECK(tx_state->op_id().IsInitialized()) << "TransactionState OpId needed for anchoring";
+
+  int key_col_size = schema()->num_key_columns();
+  if (key_col_size >= 3
+    && schema()->column(key_col_size - 1).name() == "op_id_offset"
+    && schema()->column(key_col_size - 2).name() == "op_id_index"
+    && schema()->column(key_col_size - 3).name() == "op_id_term") {
+    // LOG(INFO) << "Replacing term/index cols with val: " << tx_state->op_id().ShortDebugString() << ":" << offset;
+    ContiguousRow row_to_modify(schema(), (uint8_t *)(insert->decoded_op.row_data));
+
+    // Substitute in op_id info
+    *reinterpret_cast<int64_t *>(row_to_modify.mutable_cell_ptr(key_col_size - 3)) = tx_state->op_id().term();
+    *reinterpret_cast<int64_t *>(row_to_modify.mutable_cell_ptr(key_col_size - 2)) = tx_state->op_id().index();
+    *reinterpret_cast<int32_t *>(row_to_modify.mutable_cell_ptr(key_col_size - 1)) = offset;
+
+    // Reset key_probe with new values
+    ConstContiguousRow row_key(&key_schema_, insert->decoded_op.row_data);
+    insert->key_probe.reset(new tablet::RowSetKeyProbe(row_key));
+  } else {
+    // LOG(INFO) << "No col to replace with val: " << tx_state->op_id().ShortDebugString() << ":" << offset;
+  }
 
   ProbeStats stats;
 
@@ -495,16 +515,17 @@ void Tablet::StartApplying(WriteTransactionState* tx_state) {
 
 void Tablet::ApplyRowOperations(WriteTransactionState* tx_state) {
   StartApplying(tx_state);
-  for (RowOp* row_op : tx_state->row_ops()) {
-    ApplyRowOperation(tx_state, row_op);
+  for (int offset = 0; offset < tx_state->row_ops().size(); offset++) {
+    RowOp* row_op = tx_state->row_ops()[offset];
+    ApplyRowOperation(tx_state, row_op, offset);
   }
 }
 
 void Tablet::ApplyRowOperation(WriteTransactionState* tx_state,
-                               RowOp* row_op) {
+                               RowOp* row_op, int offset) {
   switch (row_op->decoded_op.type) {
     case RowOperationsPB::INSERT:
-      ignore_result(InsertUnlocked(tx_state, row_op));
+      ignore_result(InsertUnlocked(tx_state, row_op, offset));
       return;
 
     case RowOperationsPB::UPDATE:

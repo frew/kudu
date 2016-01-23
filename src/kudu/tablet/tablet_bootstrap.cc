@@ -1324,7 +1324,7 @@ Status TabletBootstrap::FilterAndApplyOperations(WriteTransactionState* tx_state
     }
 
     // Actually apply it.
-    tablet_->ApplyRowOperation(tx_state, op);
+    tablet_->ApplyRowOperation(tx_state, op, op_idx - 1);
     DCHECK(op->result != NULL);
 
     // We expect that the above Apply() will always succeed, because we're

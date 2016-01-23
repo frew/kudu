@@ -182,7 +182,7 @@ class Tablet {
   // Apply a single row operation, which must already be prepared.
   // The result is set back into row_op->result
   void ApplyRowOperation(WriteTransactionState* tx_state,
-                         RowOp* row_op);
+                         RowOp* row_op, int offset);
 
   // Create a new row iterator which yields the rows as of the current MVCC
   // state of this tablet.
@@ -382,7 +382,7 @@ class Tablet {
   // they were already acquired. Requires that handles for the relevant locks
   // and MVCC transaction are present in the transaction state.
   Status InsertUnlocked(WriteTransactionState *tx_state,
-                        RowOp* insert);
+                        RowOp* insert, int offset);
 
   // A version of MutateRow that does not acquire locks and instead assumes
   // they were already acquired. Requires that handles for the relevant locks
