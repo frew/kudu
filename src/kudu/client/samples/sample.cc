@@ -56,17 +56,24 @@ static Status CreateClient(const string& addr,
   return KuduClientBuilder()
       .add_master_server_addr(addr)
       .default_admin_operation_timeout(MonoDelta::FromSeconds(20))
+      .default_rpc_timeout(MonoDelta::FromSeconds(60))
       .Build(client);
 }
 
 static KuduSchema CreateSchema() {
   KuduSchema schema;
   KuduSchemaBuilder b;
-  b.AddColumn("key")->Type(KuduColumnSchema::INT32)->NotNull()->PrimaryKey();
-  b.AddColumn("int_val")->Type(KuduColumnSchema::INT32)->NotNull();
-  b.AddColumn("string_val")->Type(KuduColumnSchema::STRING)->NotNull();
-  b.AddColumn("non_null_with_default")->Type(KuduColumnSchema::INT32)->NotNull()
-    ->Default(KuduValue::FromInt(12345));
+  b.AddColumn("queue")->Type(KuduColumnSchema::INT32)->NotNull();
+  b.AddColumn("op_id_term")->Type(KuduColumnSchema::INT64)->NotNull();
+  b.AddColumn("op_id_index")->Type(KuduColumnSchema::INT64)->NotNull();
+  b.AddColumn("op_id_offset")->Type(KuduColumnSchema::INT32)->NotNull();
+  b.AddColumn("val")->Type(KuduColumnSchema::STRING)->NotNull();
+  vector<string> keys;
+  keys.push_back("queue");
+  keys.push_back("op_id_term");
+  keys.push_back("op_id_index");
+  keys.push_back("op_id_offset");
+  b.SetPrimaryKey(keys);
   KUDU_CHECK_OK(b.Build(&schema));
   return schema;
 }
@@ -91,10 +98,10 @@ static Status CreateTable(const shared_ptr<KuduClient>& client,
                           int num_tablets) {
   // Generate the split keys for the table.
   vector<const KuduPartialRow*> splits;
-  int32_t increment = 1000 / num_tablets;
+  // int32_t increment = 1000 / num_tablets;
   for (int32_t i = 1; i < num_tablets; i++) {
     KuduPartialRow* row = schema.NewRow();
-    KUDU_CHECK_OK(row->SetInt32(0, i * increment));
+    KUDU_CHECK_OK(row->SetInt32(0, i));
     splits.push_back(row);
   }
 
@@ -102,20 +109,10 @@ static Status CreateTable(const shared_ptr<KuduClient>& client,
   KuduTableCreator* table_creator = client->NewTableCreator();
   Status s = table_creator->table_name(table_name)
       .schema(&schema)
+      .num_replicas(3)
       .split_rows(splits)
       .Create();
   delete table_creator;
-  return s;
-}
-
-static Status AlterTable(const shared_ptr<KuduClient>& client,
-                         const string& table_name) {
-  KuduTableAlterer* table_alterer = client->NewTableAlterer(table_name);
-  table_alterer->AlterColumn("int_val")->RenameTo("integer_val");
-  table_alterer->AddColumn("another_val")->Type(KuduColumnSchema::BOOL);
-  table_alterer->DropColumn("string_val");
-  Status s = table_alterer->Alter();
-  delete table_alterer;
   return s;
 }
 
@@ -127,56 +124,68 @@ static void StatusCB(void* unused, const Status& status) {
 static Status InsertRows(const shared_ptr<KuduTable>& table, int num_rows) {
   shared_ptr<KuduSession> session = table->client()->NewSession();
   KUDU_RETURN_NOT_OK(session->SetFlushMode(KuduSession::MANUAL_FLUSH));
-  session->SetTimeoutMillis(5000);
+  session->SetTimeoutMillis(60000);
 
+  string val; 
+  for (int i = 0; i < 100; i++) {
+    val += 'a' + (i % 26);
+  }
+
+  KuduStatusFunctionCallback<void*> status_cb(&StatusCB, NULL);
+
+  time_t start = time(NULL);
   for (int i = 0; i < num_rows; i++) {
     KuduInsert* insert = table->NewInsert();
     KuduPartialRow* row = insert->mutable_row();
-    KUDU_CHECK_OK(row->SetInt32("key", i));
-    KUDU_CHECK_OK(row->SetInt32("integer_val", i * 2));
-    KUDU_CHECK_OK(row->SetInt32("non_null_with_default", i * 5));
+    KUDU_CHECK_OK(row->SetInt32("queue", i % 6));
+    KUDU_CHECK_OK(row->SetInt64("op_id_term", 0));
+    KUDU_CHECK_OK(row->SetInt64("op_id_index", 0));
+    KUDU_CHECK_OK(row->SetInt32("op_id_offset", 0));
+    KUDU_CHECK_OK(row->SetString("val", val));
     KUDU_CHECK_OK(session->Apply(insert));
+    if (i % 1024 == 0) {
+      session->FlushAsync(&status_cb);
+    }
   }
   Status s = session->Flush();
-  if (s.ok()) {
-    return s;
-  }
+  KUDU_RETURN_NOT_OK(s);
 
-  // Test asynchronous flush.
-  KuduStatusFunctionCallback<void*> status_cb(&StatusCB, NULL);
-  session->FlushAsync(&status_cb);
+  time_t end = time(NULL);
+  KUDU_LOG(INFO) << num_rows << " inserted in " << end - start << " seconds ";
 
   // Look at the session's errors.
   vector<KuduError*> errors;
   bool overflow;
   session->GetPendingErrors(&errors, &overflow);
-  s = overflow ? Status::IOError("Overflowed pending errors in session") :
+  if (errors.size() > 0) {
+    s = overflow ? Status::IOError("Overflowed pending errors in session") :
       errors.front()->status();
-  while (!errors.empty()) {
-    delete errors.back();
-    errors.pop_back();
+    while (!errors.empty()) {
+      delete errors.back();
+      errors.pop_back();
+    }
+    KUDU_RETURN_NOT_OK(s);
   }
-  KUDU_RETURN_NOT_OK(s);
 
   // Close the session.
   return session->Close();
 }
 
 static Status ScanRows(const shared_ptr<KuduTable>& table) {
-  const int kLowerBound = 5;
-  const int kUpperBound = 600;
+  const int kLowerBound = 0;
+  const int kUpperBound = 999;
 
   KuduScanner scanner(table.get());
 
   // Add a predicate: WHERE key >= 5
-  KuduPredicate* p = table->NewComparisonPredicate(
+  /* KuduPredicate* p = table->NewComparisonPredicate(
       "key", KuduPredicate::GREATER_EQUAL, KuduValue::FromInt(kLowerBound));
   KUDU_RETURN_NOT_OK(scanner.AddConjunctPredicate(p));
 
   // Add a predicate: WHERE key <= 600
   p = table->NewComparisonPredicate(
       "key", KuduPredicate::LESS_EQUAL, KuduValue::FromInt(kUpperBound));
-  KUDU_RETURN_NOT_OK(scanner.AddConjunctPredicate(p));
+  KUDU_RETURN_NOT_OK(scanner.AddConjunctPredicate(p)); */
 
   KUDU_RETURN_NOT_OK(scanner.Open());
   vector<KuduRowResult> results;
@@ -189,13 +198,20 @@ static Status ScanRows(const shared_ptr<KuduTable>& table) {
         iter++, next_row++) {
       const KuduRowResult& result = *iter;
       int32_t val;
-      KUDU_RETURN_NOT_OK(result.GetInt32("key", &val));
+      KUDU_RETURN_NOT_OK(result.GetInt32("queue", &val));
       if (val != next_row) {
         stringstream out;
         out << "Scan returned the wrong results. Expected key "
             << next_row << " but got " << val;
         return Status::IOError(out.str());
       }
+      /* int64_t term;
+      result.GetInt64("op_id_term", &term);
+      int64_t index;
+      result.GetInt64("op_id_index", &index);
+      int32_t offset;
+      result.GetInt32("op_id_offset", &offset);
+      KUDU_LOG(INFO) << "OP ID:" << val << ":" << term << ":" << index << ":" << offset; */
     }
     results.clear();
   }
@@ -241,7 +257,7 @@ int main(int argc, char* argv[]) {
 
   // Create and connect a client.
   shared_ptr<KuduClient> client;
-  KUDU_CHECK_OK(CreateClient("127.0.0.1", &client));
+  KUDU_CHECK_OK(CreateClient("10.240.0.5", &client));
   KUDU_LOG(INFO) << "Created a client connection";
 
   // Disable the verbose logging.
@@ -258,22 +274,18 @@ int main(int argc, char* argv[]) {
     client->DeleteTable(kTableName);
     KUDU_LOG(INFO) << "Deleting old table before creating new one";
   }
-  KUDU_CHECK_OK(CreateTable(client, kTableName, schema, 10));
+  KUDU_CHECK_OK(CreateTable(client, kTableName, schema, 6));
   KUDU_LOG(INFO) << "Created a table";
-
-  // Alter the table.
-  KUDU_CHECK_OK(AlterTable(client, kTableName));
-  KUDU_LOG(INFO) << "Altered a table";
 
   // Insert some rows into the table.
   shared_ptr<KuduTable> table;
   KUDU_CHECK_OK(client->OpenTable(kTableName, &table));
-  KUDU_CHECK_OK(InsertRows(table, 1000));
+  KUDU_CHECK_OK(InsertRows(table, 1 << 24));
   KUDU_LOG(INFO) << "Inserted some rows into a table";
 
   // Scan some rows.
-  KUDU_CHECK_OK(ScanRows(table));
-  KUDU_LOG(INFO) << "Scanned some rows out of a table";
+  // KUDU_CHECK_OK(ScanRows(table));
+  // KUDU_LOG(INFO) << "Scanned some rows out of a table";
 
   // Delete the table.
   KUDU_CHECK_OK(client->DeleteTable(kTableName));
